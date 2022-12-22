@@ -1,13 +1,13 @@
 [package]
-name = "constraint-evaluation-generator"
+name = "triton-opcodes"
 version = "0.1.0"
 edition = "2021"
 authors = ["Triton Software AG"]
 
 license = "Apache-2.0"
-description = "Generate constraint evaluation functions for Triton VM tables"
+description = "Triton VM instructions and their translations"
 homepage = "https://triton-vm.org/"
-documentation = "https://github.com/TritonVM/triton-vm/blob/master/constraint-evaluation-generator"
+documentation = "https://github.com/TritonVM/triton-vm/blob/master/triton-opcodes"
 repository = "https://github.com/TritonVM/triton-vm"
 readme = "README.md"
 
@@ -24,5 +24,9 @@ default-features = false
 
 [dependencies]
 twenty-first = "0.9"
-triton-vm = { path = "../triton-vm" }
-itertools = "0.10"
+anyhow = "1.0"
+itertools = "0.10.5"
+num-traits = "0.2"
+regex = "1.7"
+strum = "0.24"
+strum_macros = "0.24"

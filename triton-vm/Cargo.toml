@@ -1,11 +1,15 @@
 [package]
 name = "triton-vm"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 authors = ["Triton Software AG"]
 
 license = "Apache-2.0"
-description = "A virtual machine that comes with Algebraic Execution Tables (AET) and Arithmetic Intermediate Representations (AIR) for use in combination with a STARK proof system to allow proving correct execution of arbitrary programs in zero-knowledge."
+description = """
+A virtual machine that comes with Algebraic Execution Tables (AET) and Arithmetic Intermediate Representations (AIR)
+for use in combination with a STARK proof system to allow proving correct execution of arbitrary programs
+in zero-knowledge.
+"""
 homepage = "https://triton-vm.org/"
 documentation = "https://github.com/TritonVM/triton-vm/tree/master/specification"
 repository = "https://github.com/TritonVM/triton-vm"
@@ -26,8 +30,9 @@ version = "1"
 default-features = false
 
 [dependencies]
-twenty-first = { version = "0.7.2" }
-triton-profiler = { version = "0.7.2" }
+twenty-first = "0.9"
+triton-opcodes = { version = "0.1", path = "../triton-opcodes" }
+triton-profiler = "0.9"
 anyhow = "1.0"
 bincode = "1.3"
 blake3 = "1.2"
@@ -60,7 +65,7 @@ serde_with = "2.1"
 structopt = { version = "0.3", features = ["paw"] }
 strum = "0.24"
 strum_macros = "0.24"
-
+ndarray = { version = "0.15", features = ["rayon"] }
 
 [[bench]]
 name = "prove_halt"

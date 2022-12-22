@@ -1,34 +1,32 @@
-use anyhow::Result;
-use itertools::Itertools;
-use num_traits::{One, Zero};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fmt::Display;
 
+use anyhow::Result;
+use ndarray::Array1;
+use num_traits::One;
+use num_traits::Zero;
+
+use triton_opcodes::instruction::DivinationHint;
+use triton_opcodes::instruction::{AnInstruction::*, Instruction};
+use triton_opcodes::ord_n::{Ord16, Ord16::*, Ord7};
+use triton_opcodes::program::Program;
 use twenty_first::shared_math::b_field_element::BFieldElement;
-use twenty_first::shared_math::rescue_prime_regular::{
-    RescuePrimeRegular, DIGEST_LENGTH, NUM_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
-};
+use twenty_first::shared_math::rescue_prime_regular::RescuePrimeRegular;
+use twenty_first::shared_math::rescue_prime_regular::DIGEST_LENGTH;
+use twenty_first::shared_math::rescue_prime_regular::NUM_ROUNDS;
+use twenty_first::shared_math::rescue_prime_regular::STATE_SIZE;
 use twenty_first::shared_math::traits::Inverse;
 use twenty_first::shared_math::x_field_element::XFieldElement;
 
 use crate::error::vm_err;
-use crate::instruction::DivinationHint;
-use crate::ord_n::{Ord16, Ord7};
-use crate::table::base_matrix::ProcessorMatrixRow;
-use crate::table::hash_table::{NUM_ROUND_CONSTANTS, TOTAL_NUM_CONSTANTS};
-use crate::table::table_column::{
-    InstructionBaseTableColumn, JumpStackBaseTableColumn, OpStackBaseTableColumn,
-    ProcessorBaseTableColumn, RamBaseTableColumn,
-};
-
-use super::error::{vm_fail, InstructionError::*};
-use super::instruction::{AnInstruction::*, Instruction};
-use super::op_stack::OpStack;
-use super::ord_n::{Ord16::*, Ord7::*};
-use super::table::{hash_table, instruction_table, jump_stack_table, op_stack_table};
-use super::table::{processor_table, ram_table};
-use super::vm::Program;
+use crate::error::vm_fail;
+use crate::error::InstructionError::*;
+use crate::op_stack::OpStack;
+use crate::table::processor_table;
+use crate::table::processor_table::ProcessorMatrixRow;
+use crate::table::table_column::BaseTableColumn;
+use crate::table::table_column::ProcessorBaseTableColumn;
 
 /// The number of state registers for hashing-specific instructions.
 pub const STATE_REGISTER_COUNT: usize = 16;
@@ -65,6 +63,9 @@ pub struct VMState<'pgm> {
     /// Current instruction's address in program memory
     pub instruction_pointer: usize,
 
+    /// The instruction that was executed last
+    pub previous_instruction: BFieldElement,
+
     /// RAM pointer
     pub ramp: u64,
 }
@@ -77,7 +78,7 @@ pub enum VMOutput {
     /// Trace of state registers for hash coprocessor table
     ///
     /// One row per round in the XLIX permutation
-    XlixTrace(Vec<[BFieldElement; hash_table::BASE_WIDTH]>),
+    XlixTrace(Box<[[BFieldElement; STATE_SIZE]; 1 + NUM_ROUNDS]>),
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -185,6 +186,11 @@ impl<'pgm> VMState<'pgm> {
         // All instructions increase the cycle count
         self.cycle_count += 1;
         let mut vm_output = None;
+        self.previous_instruction = match self.current_instruction() {
+            Ok(instruction) => instruction.opcode_b(),
+            // trying to read past the end of the program doesn't change the previous instruction
+            Err(_) => self.previous_instruction,
+        };
 
         match self.current_instruction()? {
             Pop => {
@@ -305,8 +311,7 @@ impl<'pgm> VMState<'pgm> {
                 let hash_input: [BFieldElement; 2 * DIGEST_LENGTH] = self.op_stack.pop_n()?;
                 let hash_trace = RescuePrimeRegular::trace(&hash_input);
                 let hash_output = &hash_trace[hash_trace.len() - 1][0..DIGEST_LENGTH];
-                let hash_trace_with_round_constants = Self::inprocess_hash_trace(&hash_trace);
-                vm_output = Some(VMOutput::XlixTrace(hash_trace_with_round_constants));
+                vm_output = Some(VMOutput::XlixTrace(Box::new(hash_trace)));
 
                 for i in (0..DIGEST_LENGTH).rev() {
                     self.op_stack.push(hash_output[i]);
@@ -435,111 +440,53 @@ impl<'pgm> VMState<'pgm> {
         Ok(vm_output)
     }
 
-    pub fn to_instruction_row(
-        &self,
-        current_instruction: Instruction,
-    ) -> [BFieldElement; instruction_table::BASE_WIDTH] {
-        use InstructionBaseTableColumn::*;
-        let mut row = [BFieldElement::zero(); instruction_table::BASE_WIDTH];
-
-        row[usize::from(Address)] = (self.instruction_pointer as u32).into();
-        row[usize::from(CI)] = current_instruction.opcode_b();
-        row[usize::from(NIA)] = self.nia();
-
-        row
-    }
-
-    pub fn to_processor_row(&self) -> [BFieldElement; processor_table::BASE_WIDTH] {
+    pub fn to_processor_row(&self) -> Array1<BFieldElement> {
         use ProcessorBaseTableColumn::*;
-        let mut row = [BFieldElement::zero(); processor_table::BASE_WIDTH];
+        let mut row = Array1::zeros(processor_table::BASE_WIDTH);
 
         let current_instruction = self.current_instruction().unwrap_or(Nop);
         let hvs = self.derive_helper_variables();
         let ramp = self.ramp.into();
 
-        row[usize::from(CLK)] = BFieldElement::new(self.cycle_count as u64);
-        row[usize::from(IP)] = (self.instruction_pointer as u32).into();
-        row[usize::from(CI)] = current_instruction.opcode_b();
-        row[usize::from(NIA)] = self.nia();
-        row[usize::from(IB0)] = current_instruction.ib(Ord7::IB0);
-        row[usize::from(IB1)] = current_instruction.ib(Ord7::IB1);
-        row[usize::from(IB2)] = current_instruction.ib(Ord7::IB2);
-        row[usize::from(IB3)] = current_instruction.ib(Ord7::IB3);
-        row[usize::from(IB4)] = current_instruction.ib(Ord7::IB4);
-        row[usize::from(IB5)] = current_instruction.ib(Ord7::IB5);
-        row[usize::from(IB6)] = current_instruction.ib(Ord7::IB6);
-        row[usize::from(JSP)] = self.jsp();
-        row[usize::from(JSO)] = self.jso();
-        row[usize::from(JSD)] = self.jsd();
-        row[usize::from(ST0)] = self.op_stack.st(Ord16::ST0);
-        row[usize::from(ST1)] = self.op_stack.st(Ord16::ST1);
-        row[usize::from(ST2)] = self.op_stack.st(Ord16::ST2);
-        row[usize::from(ST3)] = self.op_stack.st(Ord16::ST3);
-        row[usize::from(ST4)] = self.op_stack.st(Ord16::ST4);
-        row[usize::from(ST5)] = self.op_stack.st(Ord16::ST5);
-        row[usize::from(ST6)] = self.op_stack.st(Ord16::ST6);
-        row[usize::from(ST7)] = self.op_stack.st(Ord16::ST7);
-        row[usize::from(ST8)] = self.op_stack.st(Ord16::ST8);
-        row[usize::from(ST9)] = self.op_stack.st(Ord16::ST9);
-        row[usize::from(ST10)] = self.op_stack.st(Ord16::ST10);
-        row[usize::from(ST11)] = self.op_stack.st(Ord16::ST11);
-        row[usize::from(ST12)] = self.op_stack.st(Ord16::ST12);
-        row[usize::from(ST13)] = self.op_stack.st(Ord16::ST13);
-        row[usize::from(ST14)] = self.op_stack.st(Ord16::ST14);
-        row[usize::from(ST15)] = self.op_stack.st(Ord16::ST15);
-        row[usize::from(OSP)] = self.op_stack.osp();
-        row[usize::from(OSV)] = self.op_stack.osv();
-        row[usize::from(HV0)] = hvs[0];
-        row[usize::from(HV1)] = hvs[1];
-        row[usize::from(HV2)] = hvs[2];
-        row[usize::from(HV3)] = hvs[3];
-        row[usize::from(RAMP)] = ramp;
-        row[usize::from(RAMV)] = *self.ram.get(&ramp).unwrap_or(&BFieldElement::zero());
-
-        row
-    }
-
-    pub fn to_op_stack_row(
-        &self,
-        current_instruction: Instruction,
-    ) -> [BFieldElement; op_stack_table::BASE_WIDTH] {
-        use OpStackBaseTableColumn::*;
-        let mut row = [BFieldElement::zero(); op_stack_table::BASE_WIDTH];
-
-        row[usize::from(CLK)] = BFieldElement::new(self.cycle_count as u64);
-        row[usize::from(IB1ShrinkStack)] = current_instruction.ib(IB1);
-        row[usize::from(OSP)] = self.op_stack.osp();
-        row[usize::from(OSV)] = self.op_stack.osv();
-
-        row
-    }
-
-    pub fn to_ram_row(&self) -> [BFieldElement; ram_table::BASE_WIDTH] {
-        use RamBaseTableColumn::*;
-        let ramp = self.op_stack.st(ST1);
-
-        let mut row = [BFieldElement::zero(); ram_table::BASE_WIDTH];
-
-        row[usize::from(CLK)] = BFieldElement::new(self.cycle_count as u64);
-        row[usize::from(RAMP)] = ramp;
-        row[usize::from(RAMV)] = *self.ram.get(&ramp).unwrap_or(&BFieldElement::zero());
-        // value of InverseOfRampDifference is only known after sorting the RAM Table, thus not set
-
-        row
-    }
-
-    pub fn to_jump_stack_row(
-        &self,
-        current_instruction: Instruction,
-    ) -> [BFieldElement; jump_stack_table::BASE_WIDTH] {
-        use JumpStackBaseTableColumn::*;
-        let mut row = [BFieldElement::zero(); jump_stack_table::BASE_WIDTH];
-
-        row[usize::from(CLK)] = BFieldElement::new(self.cycle_count as u64);
-        row[usize::from(CI)] = current_instruction.opcode_b();
-        row[usize::from(JSP)] = self.jsp();
-        row[usize::from(JSO)] = self.jso();
-        row[usize::from(JSD)] = self.jsd();
+        row[CLK.base_table_index()] = BFieldElement::new(self.cycle_count as u64);
+        row[PreviousInstruction.base_table_index()] = self.previous_instruction;
+        row[IP.base_table_index()] = (self.instruction_pointer as u32).into();
+        row[CI.base_table_index()] = current_instruction.opcode_b();
+        row[NIA.base_table_index()] = self.nia();
+        row[IB0.base_table_index()] = current_instruction.ib(Ord7::IB0);
+        row[IB1.base_table_index()] = current_instruction.ib(Ord7::IB1);
+        row[IB2.base_table_index()] = current_instruction.ib(Ord7::IB2);
+        row[IB3.base_table_index()] = current_instruction.ib(Ord7::IB3);
+        row[IB4.base_table_index()] = current_instruction.ib(Ord7::IB4);
+        row[IB5.base_table_index()] = current_instruction.ib(Ord7::IB5);
+        row[IB6.base_table_index()] = current_instruction.ib(Ord7::IB6);
+        row[JSP.base_table_index()] = self.jsp();
+        row[JSO.base_table_index()] = self.jso();
+        row[JSD.base_table_index()] = self.jsd();
+        row[ST0.base_table_index()] = self.op_stack.st(Ord16::ST0);
+        row[ST1.base_table_index()] = self.op_stack.st(Ord16::ST1);
+        row[ST2.base_table_index()] = self.op_stack.st(Ord16::ST2);
+        row[ST3.base_table_index()] = self.op_stack.st(Ord16::ST3);
+        row[ST4.base_table_index()] = self.op_stack.st(Ord16::ST4);
+        row[ST5.base_table_index()] = self.op_stack.st(Ord16::ST5);
+        row[ST6.base_table_index()] = self.op_stack.st(Ord16::ST6);
+        row[ST7.base_table_index()] = self.op_stack.st(Ord16::ST7);
+        row[ST8.base_table_index()] = self.op_stack.st(Ord16::ST8);
+        row[ST9.base_table_index()] = self.op_stack.st(Ord16::ST9);
+        row[ST10.base_table_index()] = self.op_stack.st(Ord16::ST10);
+        row[ST11.base_table_index()] = self.op_stack.st(Ord16::ST11);
+        row[ST12.base_table_index()] = self.op_stack.st(Ord16::ST12);
+        row[ST13.base_table_index()] = self.op_stack.st(Ord16::ST13);
+        row[ST14.base_table_index()] = self.op_stack.st(Ord16::ST14);
+        row[ST15.base_table_index()] = self.op_stack.st(Ord16::ST15);
+        row[OSP.base_table_index()] = self.op_stack.osp();
+        row[OSV.base_table_index()] = self.op_stack.osv();
+        row[HV0.base_table_index()] = hvs[0];
+        row[HV1.base_table_index()] = hvs[1];
+        row[HV2.base_table_index()] = hvs[2];
+        row[HV3.base_table_index()] = hvs[3];
+        row[RAMP.base_table_index()] = ramp;
+        row[RAMV.base_table_index()] = self.memory_get(&ramp);
 
         row
     }
@@ -727,52 +674,6 @@ impl<'pgm> VMState<'pgm> {
 
         Ok(())
     }
-
-    fn inprocess_hash_trace(
-        hash_trace: &[[BFieldElement;
-              hash_table::BASE_WIDTH - hash_table::NUM_ROUND_CONSTANTS - 1]],
-    ) -> Vec<[BFieldElement; hash_table::BASE_WIDTH]> {
-        let mut hash_trace_with_constants = vec![];
-        for (index, trace_row) in hash_trace.iter().enumerate() {
-            let round_number = index + 1;
-            let round_constants = Self::rescue_xlix_round_constants_by_round_number(round_number);
-            let mut new_trace_row = [BFieldElement::zero(); hash_table::BASE_WIDTH];
-            let mut offset = 0;
-            new_trace_row[offset] = BFieldElement::new(round_number as u64);
-            offset += 1;
-            new_trace_row[offset..offset + STATE_SIZE].copy_from_slice(trace_row);
-            offset += STATE_SIZE;
-            new_trace_row[offset..].copy_from_slice(&round_constants);
-            hash_trace_with_constants.push(new_trace_row)
-        }
-        hash_trace_with_constants
-    }
-
-    /// rescue_xlix_round_constants_by_round_number
-    /// returns the 2m round constant for round `round_number`.
-    /// This counter starts at 1; round number 0 indicates padding;
-    /// and round number 9 indicates a transition to a new hash so
-    /// the round constants will be all zeros.
-    fn rescue_xlix_round_constants_by_round_number(
-        round_number: usize,
-    ) -> [BFieldElement; NUM_ROUND_CONSTANTS] {
-        let round_constants: [BFieldElement; TOTAL_NUM_CONSTANTS] = ROUND_CONSTANTS
-            .iter()
-            .map(|&x| BFieldElement::new(x))
-            .collect_vec()
-            .try_into()
-            .unwrap();
-
-        match round_number {
-            0 => [BFieldElement::zero(); hash_table::NUM_ROUND_CONSTANTS],
-            i if i <= NUM_ROUNDS => round_constants
-                [NUM_ROUND_CONSTANTS * (i - 1)..NUM_ROUND_CONSTANTS * i]
-                .try_into()
-                .unwrap(),
-            i if i == NUM_ROUNDS + 1 => [BFieldElement::zero(); hash_table::NUM_ROUND_CONSTANTS],
-            _ => panic!("Round with number {round_number} does not have round constants."),
-        }
-    }
 }
 
 impl<'pgm> Display for VMState<'pgm> {
@@ -780,7 +681,7 @@ impl<'pgm> Display for VMState<'pgm> {
         match self.current_instruction() {
             Ok(_) => {
                 let row = self.to_processor_row();
-                write!(f, "{}", ProcessorMatrixRow { row })
+                write!(f, "{}", ProcessorMatrixRow { row: row.view() })
             }
             Err(_) => write!(f, "END-OF-FILE"),
         }
@@ -789,16 +690,18 @@ impl<'pgm> Display for VMState<'pgm> {
 
 #[cfg(test)]
 mod vm_state_tests {
-
+    use itertools::Itertools;
     use twenty_first::shared_math::other::random_elements_array;
     use twenty_first::shared_math::rescue_prime_digest::Digest;
     use twenty_first::util_types::algebraic_hasher::AlgebraicHasher;
     use twenty_first::util_types::merkle_tree::MerkleTree;
     use twenty_first::util_types::merkle_tree_maker::MerkleTreeMaker;
 
-    use crate::instruction::sample_programs;
     use crate::op_stack::OP_STACK_REG_COUNT;
+    use crate::shared_tests::{FIBONACCI_VIT, FIB_FIXED_7_LT};
     use crate::stark::Maker;
+    use crate::vm::run;
+    use crate::vm::triton_vm_tests::GCD_X_Y;
 
     use super::*;
 
@@ -816,8 +719,8 @@ mod vm_state_tests {
 
     #[test]
     fn run_tvm_parse_pop_p_test() {
-        let program = sample_programs::push_push_add_pop_p();
-        let (trace, _out, _err) = program.run(vec![], vec![]);
+        let program = Program::from_code("push 1 push 1 add pop").unwrap();
+        let (trace, _out, _err) = run(&program, vec![], vec![]);
 
         for state in trace.iter() {
             println!("{}", state);
@@ -826,9 +729,27 @@ mod vm_state_tests {
 
     #[test]
     fn run_tvm_hello_world_1_test() {
-        let code = sample_programs::HELLO_WORLD_1;
+        let code = "
+            push 10
+            push 33
+            push 100
+            push 108
+            push 114
+            push 111
+            push 87
+            push 32
+            push 44
+            push 111
+            push 108
+            push 108
+            push 101
+            push 72
+        
+            write_io write_io write_io write_io write_io write_io write_io
+            write_io write_io write_io write_io write_io write_io write_io
+        ";
         let program = Program::from_code(code).unwrap();
-        let (trace, _out, _err) = program.run(vec![], vec![]);
+        let (trace, _out, _err) = run(&program, vec![], vec![]);
 
         let last_state = trace.last().unwrap();
         assert_eq!(BFieldElement::zero(), last_state.op_stack.safe_peek(ST0));
@@ -840,7 +761,7 @@ mod vm_state_tests {
     fn run_tvm_halt_then_do_stuff_test() {
         let halt_then_do_stuff = "halt push 1 push 2 add invert write_io";
         let program = Program::from_code(halt_then_do_stuff).unwrap();
-        let (trace, _out, err) = program.run(vec![], vec![]);
+        let (trace, _out, err) = run(&program, vec![], vec![]);
 
         for state in trace.iter() {
             println!("{}", state);
@@ -856,16 +777,18 @@ mod vm_state_tests {
 
     #[test]
     fn run_tvm_basic_ram_read_write_test() {
-        let program = Program::from_code(sample_programs::BASIC_RAM_READ_WRITE).unwrap();
-
-        for instruction in program.instructions.iter() {
-            println!("Instruction opcode: {}", instruction.opcode());
-        }
-        let (trace, _out, err) = program.run(vec![], vec![]);
-
-        for state in trace.iter() {
-            println!("{}", state);
-        }
+        let basic_ram_read_write_code = "
+            push  5 push  6 write_mem pop pop 
+            push 15 push 16 write_mem pop pop 
+            push  5 push  0 read_mem  pop pop 
+            push 15 push  0 read_mem  pop pop 
+            push  5 push  7 write_mem pop pop 
+            push 15 push  0 read_mem 
+            push  5 push  0 read_mem 
+            halt
+            ";
+        let program = Program::from_code(basic_ram_read_write_code).unwrap();
+        let (trace, _out, err) = run(&program, vec![], vec![]);
         if let Some(e) = err {
             println!("Error: {}", e);
         }
@@ -885,12 +808,15 @@ mod vm_state_tests {
 
     #[test]
     fn run_tvm_edgy_ram_writes_test() {
-        let program = Program::from_code(sample_programs::EDGY_RAM_WRITES).unwrap();
-        let (trace, _out, err) = program.run(vec![], vec![]);
-
-        for state in trace.iter() {
-            println!("{}", state);
-        }
+        let edgy_ram_writes_code = "
+            write_mem                          // this should write 0 to address 0
+            push 5 swap2 push 3 swap2 pop pop  // stack is now of length 16 again
+            write_mem                          // this should write 3 to address 5
+            swap2 read_mem                     // stack's top should now be 3, 5, 3, 0, 0, …
+            halt
+        ";
+        let program = Program::from_code(edgy_ram_writes_code).unwrap();
+        let (trace, _out, err) = run(&program, vec![], vec![]);
         if let Some(e) = err {
             println!("Error: {}", e);
         }
@@ -908,10 +834,37 @@ mod vm_state_tests {
 
     #[test]
     fn run_tvm_sample_weights_test() {
-        let program = Program::from_code(sample_programs::SAMPLE_WEIGHTS).unwrap();
+        // TVM assembly to sample weights for the recursive verifier
+        //
+        // input: seed, num_weights
+        //
+        // output: num_weights-many random weights
+        let sample_weights_code = "
+            push 17 push 13 push 11        // get seed - should be an argument
+            read_io                        // number of weights - should be argument
+            sample_weights:                // proper program starts here
+            call sample_weights_loop       // setup done, start sampling loop
+            pop pop                        // clean up stack: RAM value & pointer
+            pop pop pop pop                // clean up stack: seed & countdown
+            halt                           // done - should be return
+
+            sample_weights_loop:           // subroutine: loop until all weights are sampled
+              dup0 push 0 eq skiz return   // no weights left
+              push -1 add                  // decrease number of weights to still sample
+              push 0 push 0 push 0 push 0  // prepare for hashing
+              push 0 push 0 push 0 push 0  // prepare for hashing
+              dup11 dup11 dup11 dup11      // prepare for hashing
+              hash                         // hash seed & countdown
+              swap13 swap10 pop            // re-organize stack
+              swap13 swap10 pop            // re-organize stack
+              swap13 swap10 swap7          // re-organize stack
+              pop pop pop pop pop pop pop  // remove unnecessary remnants of digest
+              recurse                      // repeat
+        ";
+        let program = Program::from_code(sample_weights_code).unwrap();
         println!("Successfully parsed the program.");
         let input_symbols = vec![BFieldElement::new(11)];
-        let (trace, _out, err) = program.run(input_symbols, vec![]);
+        let (trace, _out, err) = run(&program, input_symbols, vec![]);
 
         for state in trace.iter() {
             println!("{}", state);
@@ -924,6 +877,74 @@ mod vm_state_tests {
         let last_state = trace.last().unwrap();
         assert_eq!(last_state.current_instruction().unwrap(), Halt);
     }
+
+    /// TVM assembly to verify Merkle authentication paths
+    ///
+    /// input: merkle root, number of leafs, leaf values, APs
+    ///
+    /// output: Result<(), VMFail>
+    const MT_AP_VERIFY: &str = concat!(
+        "read_io ",                                 // number of authentication paths to test
+        "",                                         // stack: [num]
+        "mt_ap_verify: ",                           // proper program starts here
+        "push 0 swap1 write_mem pop pop ",          // store number of APs at RAM address 0
+        "",                                         // stack: []
+        "read_io read_io read_io read_io read_io ", // read Merkle root
+        "",                                         // stack: [r4 r3 r2 r1 r0]
+        "call check_aps ",                          //
+        "pop pop pop pop pop ",                     // leave clean stack: Merkle root
+        "",                                         // stack: []
+        "halt ",                                    // done – should be “return”
+        "",
+        "",                               // subroutine: check AP one at a time
+        "",                               // stack before: [* r4 r3 r2 r1 r0]
+        "",                               // stack after: [* r4 r3 r2 r1 r0]
+        "check_aps: ",                    // start function description:
+        "push 0 push 0 read_mem dup0 ",   // get number of APs left to check
+        "",                               // stack: [* r4 r3 r2 r1 r0 0 num_left num_left]
+        "push 0 eq ",                     // see if there are authentication paths left
+        "",                               // stack: [* r4 r3 r2 r1 r0 0 num_left num_left==0]
+        "skiz return ",                   // return if no authentication paths left
+        "push -1 add write_mem pop pop ", // decrease number of authentication paths left to check
+        "",                               // stack: [* r4 r3 r2 r1 r0]
+        "call get_idx_and_hash_leaf ",    //
+        "",                               // stack: [* r4 r3 r2 r1 r0 idx d4 d3 d2 d1 d0 0 0 0 0 0]
+        "call traverse_tree ",            //
+        "",                               // stack: [* r4 r3 r2 r1 r0 idx>>2 - - - - - - - - - -]
+        "call assert_tree_top ",          //
+        // stack: [* r4 r3 r2 r1 r0]
+        "recurse ", // check next AP
+        "",
+        "",                                         // subroutine: read index & hash leaf
+        "",                                         // stack before: [*]
+        "",                        // stack afterwards: [* idx d4 d3 d2 d1 d0 0 0 0 0 0]
+        "get_idx_and_hash_leaf: ", // start function description:
+        "read_io ",                // read node index
+        "read_io read_io read_io read_io read_io ", // read leaf's value
+        "push 0 push 0 push 0 push 0 push 0 ", // pad before fixed-length hash
+        "hash return ",            // compute leaf's digest
+        "",
+        "",                             // subroutine: go up tree
+        "",                             // stack before: [* idx - - - - - - - - - -]
+        "",                             // stack after: [* idx>>2 - - - - - - - - - -]
+        "traverse_tree: ",              // start function description:
+        "dup10 push 1 eq skiz return ", // break loop if node index is 1
+        "divine_sibling hash recurse ", // move up one level in the Merkle tree
+        "",
+        "",                     // subroutine: compare digests
+        "",                     // stack before: [* r4 r3 r2 r1 r0 idx a b c d e - - - - -]
+        "",                     // stack after: [* r4 r3 r2 r1 r0]
+        "assert_tree_top: ",    // start function description:
+        "pop pop pop pop pop ", // remove unnecessary “0”s from hashing
+        "",                     // stack: [* r4 r3 r2 r1 r0 idx a b c d e]
+        "swap1 swap2 swap3 swap4 swap5 ",
+        "",                     // stack: [* r4 r3 r2 r1 r0 a b c d e idx]
+        "assert ",              //
+        "",                     // stack: [* r4 r3 r2 r1 r0 a b c d e]
+        "assert_vector ",       // actually compare to root of tree
+        "pop pop pop pop pop ", // clean up stack, leave only one root
+        "return ",              //
+    );
 
     #[test]
     fn run_tvm_mt_ap_verify_test() {
@@ -941,7 +962,7 @@ mod vm_state_tests {
         let root: Digest = merkle_tree.get_root();
 
         // generate program
-        let program = Program::from_code(sample_programs::MT_AP_VERIFY).unwrap();
+        let program = Program::from_code(MT_AP_VERIFY).unwrap();
         let order: Vec<usize> = (0..5).rev().collect();
 
         let selected_leaf_indices = [0, 28, 55];
@@ -1001,7 +1022,7 @@ mod vm_state_tests {
             leafs[55].values()[order[4]],
         ];
 
-        let (trace, _out, err) = program.run(input, secret_input);
+        let (trace, _out, err) = run(&program, input, secret_input);
 
         for state in trace.iter() {
             println!("{}", state);
@@ -1017,10 +1038,23 @@ mod vm_state_tests {
 
     #[test]
     fn run_tvm_get_colinear_y_test() {
-        let program = Program::from_code(sample_programs::GET_COLINEAR_Y).unwrap();
+        // see also: get_colinear_y in src/shared_math/polynomial.rs
+        let get_colinear_y_code = "
+            read_io                       // p2_x
+            read_io read_io               // p1_y p1_x
+            read_io read_io               // p0_y p0_x
+            swap3 push -1 mul dup1 add    // dy = p0_y - p1_y
+            dup3 push -1 mul dup5 add mul // dy·(p2_x - p0_x)
+            dup3 dup3 push -1 mul add     // dx = p0_x - p1_x
+            invert mul add                // compute result
+            swap3 pop pop pop             // leave a clean stack
+            write_io halt
+        ";
+
+        let program = Program::from_code(get_colinear_y_code).unwrap();
         println!("Successfully parsed the program.");
         let input_symbols = [7, 2, 1, 3, 4].map(BFieldElement::new).to_vec();
-        let (trace, out, err) = program.run(input_symbols, vec![]);
+        let (trace, out, err) = run(&program, input_symbols, vec![]);
         assert_eq!(out[0], BFieldElement::new(4));
         for state in trace.iter() {
             println!("{}", state);
@@ -1036,9 +1070,24 @@ mod vm_state_tests {
 
     #[test]
     fn run_tvm_countdown_from_10_test() {
-        let code = sample_programs::COUNTDOWN_FROM_10;
-        let program = Program::from_code(code).unwrap();
-        let (trace, out, err) = program.run(vec![], vec![]);
+        let countdown_code = "
+            push 10
+            call loop
+            
+            loop:
+                dup0
+                write_io
+                push -1
+                add
+                dup0
+                skiz
+                  recurse
+                write_io
+                halt
+            ";
+
+        let program = Program::from_code(countdown_code).unwrap();
+        let (trace, out, err) = run(&program, vec![], vec![]);
 
         println!("{}", program);
         for state in trace.iter() {
@@ -1055,14 +1104,9 @@ mod vm_state_tests {
 
     #[test]
     fn run_tvm_fibonacci_vit_tvm() {
-        let code = sample_programs::FIBONACCI_VIT;
+        let code = FIBONACCI_VIT;
         let program = Program::from_code(code).unwrap();
-
-        let (trace, out, err) = program.run(vec![7_u64.into()], vec![]);
-
-        for state in trace.iter() {
-            println!("{}", state);
-        }
+        let (_trace, out, err) = run(&program, vec![7_u64.into()], vec![]);
         if let Some(e) = err {
             panic!("The VM encountered an error: {e}");
         }
@@ -1072,26 +1116,20 @@ mod vm_state_tests {
 
     #[test]
     fn run_tvm_fibonacci_lt_test() {
-        let code = sample_programs::FIB_FIXED_7_LT;
+        let code = FIB_FIXED_7_LT;
         let program = Program::from_code(code).unwrap();
-        let (trace, _out, _err) = program.run(vec![], vec![]);
-
-        println!("{}", program);
-        for state in trace.iter() {
-            println!("{}", state);
-        }
-
+        let (trace, _out, _err) = run(&program, vec![], vec![]);
         let last_state = trace.last().unwrap();
         assert_eq!(BFieldElement::new(21), last_state.op_stack.st(ST0));
     }
 
     #[test]
     fn run_tvm_gcd_test() {
-        let code = sample_programs::GCD_X_Y;
+        let code = GCD_X_Y;
         let program = Program::from_code(code).unwrap();
 
         println!("{}", program);
-        let (trace, out, _err) = program.run(vec![42_u64.into(), 56_u64.into()], vec![]);
+        let (trace, out, _err) = run(&program, vec![42_u64.into(), 56_u64.into()], vec![]);
 
         println!("{}", program);
         for state in trace.iter() {
@@ -1107,17 +1145,13 @@ mod vm_state_tests {
     fn run_tvm_swap_test() {
         let code = "push 1 push 2 swap1 halt";
         let program = Program::from_code(code).unwrap();
-        let (trace, _out, _err) = program.run(vec![], vec![]);
-
-        for state in trace.iter() {
-            println!("{}", state);
-        }
+        let (_trace, _out, _err) = run(&program, vec![], vec![]);
     }
 
     #[test]
     fn read_mem_unitialized() {
         let program = Program::from_code("read_mem halt").unwrap();
-        let (trace, _out, err) = program.run(vec![], vec![]);
+        let (trace, _out, err) = run(&program, vec![], vec![]);
         assert!(err.is_none(), "Reading from uninitialized memory address");
         assert_eq!(2, trace.len());
     }
