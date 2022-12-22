@@ -461,6 +461,14 @@ pub mod triton_vm_tests {
         )
     }
 
+    pub fn test_program_for_eq_vector() -> SourceCodeAndInput {
+        SourceCodeAndInput::without_input(
+            "push 1 push 2 push 3 push 4 push 5 \
+             push 1 push 2 push 3 push 4 push 5 \
+             eq_vector halt",
+        )
+    }
+
     pub fn property_based_test_program_for_assert_vector() -> SourceCodeAndInput {
         let mut rng = ThreadRng::default();
         let st0 = rng.gen_range(0..BFieldElement::QUOTIENT);
@@ -762,6 +770,7 @@ pub mod triton_vm_tests {
             test_program_for_divine_sibling_noswitch(),
             test_program_for_divine_sibling_switch(),
             test_program_for_assert_vector(),
+            test_program_for_eq_vector(),
             test_program_for_add_mul_invert(),
             test_program_for_eq(),
             test_program_for_lsb(),

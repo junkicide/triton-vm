@@ -515,6 +515,8 @@ fn parse_token(token: &str, tokens: &mut SplitWhitespace) -> Result<Vec<Labelled
         "is_u32" => pseudo_instruction_is_u32(),
         "split_assert" => pseudo_instruction_split_assert(),
 
+        "eq_vector" => pseudo_instruction_eq_vector(),
+
         // Read/write
         "read_io" => vec![ReadIo],
         "write_io" => vec![WriteIo],
@@ -700,6 +702,30 @@ fn pseudo_instruction_reverse() -> Vec<AnInstruction<String>> {
         instructions.push(Add);
     }
     instructions
+}
+
+fn pseudo_instruction_eq_vector() -> Vec<AnInstruction<String>> {
+    vec![
+        Dup(ST0),
+        Dup(ST5),
+        Eq,
+        Dup(ST1),
+        Dup(ST6),
+        Eq,
+        Mul,
+        Dup(ST2),
+        Dup(ST7),
+        Eq,
+        Mul,
+        Dup(ST3),
+        Dup(ST8),
+        Eq,
+        Mul,
+        Dup(ST4),
+        Dup(ST9),
+        Eq,
+        Mul,
+    ]
 }
 
 fn parse_elem(tokens: &mut SplitWhitespace) -> Result<BFieldElement> {
